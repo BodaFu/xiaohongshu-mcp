@@ -877,12 +877,31 @@ func (s *AppServer) handleGetUnprocessedNotifications(ctx context.Context, args 
 		}
 	}
 
+	// 找出 retry_ids 里在本次扫描中未出现的 ID（可能超出翻页范围或通知已消失）
+	// 这些 ID 需要单独告知 Liko，让她决定是继续重试还是标记为已跳过
+	seenIDs := make(map[string]bool)
+	for _, n := range result.Notifications {
+		seenIDs[n.NotificationID] = true
+	}
+	var missingRetryIDs []string
+	for id := range retryIDs {
+		if !seenIDs[id] {
+			missingRetryIDs = append(missingRetryIDs, id)
+		}
+	}
+
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("扫描完成：共扫描 %d 页 %d 条通知，跳过已完成 %d 条，过滤超时窗口 %d 条，待处理 %d 条（全新 %d + 待重试 %d）\n",
 		result.PagesScanned, result.TotalScanned, result.TotalSkipped, result.TotalTooOld,
 		result.TotalNew+result.TotalRetry, result.TotalNew, result.TotalRetry))
 	if result.HasMore {
 		sb.WriteString("⚠️ 待处理通知超过单次返回上限，本次仅返回部分。处理完后请再次调用获取剩余通知。\n")
+	}
+	if len(missingRetryIDs) > 0 {
+		sb.WriteString(fmt.Sprintf("⚠️ 以下 %d 个待重试通知在本次扫描范围内未找到（可能已超出翻页范围或通知已消失），请酌情标记为已跳过：\n", len(missingRetryIDs)))
+		for _, id := range missingRetryIDs {
+			sb.WriteString(fmt.Sprintf("  - %s\n", id))
+		}
 	}
 	sb.WriteString("\n")
 
@@ -939,36 +958,40 @@ func (s *AppServer) handleGetUnprocessedNotifications(ctx context.Context, args 
 	}
 }
 
-// extractSinceUnixFromIDs 从 processed_ids / retry_ids 中提取最大雪花 ID 对应的 Unix 时间戳（秒）。
+// extractSinceUnixFromIDs 从 processed_ids / retry_ids 中提取最小雪花 ID 对应的 Unix 时间戳（秒）。
 // 小红书雪花 ID 高 41 位是毫秒时间戳（相对于 2013-01-01 00:00:00 UTC 的偏移）。
-// 取最大 ID 对应的时间，作为"只返回这个时间点之后的通知"的下界。
-// 如果所有集合都为空，返回 0（调用方退回默认时间窗口）。
+//
+// 取最小 ID（最早的已处理通知）对应的时间作为扫描起点下界，确保所有已处理通知都在扫描窗口内，
+// 从而保证去重逻辑能正确过滤掉已处理的通知，防止重复回复。
+//
+// 如果所有集合都为空（首次运行），返回 0，调用方退回 since_hours 兜底。
 func extractSinceUnixFromIDs(sets ...map[string]bool) int64 {
 	// 小红书雪花 ID epoch：2013-01-01 00:00:00 UTC（毫秒）
 	const xhsEpochMs int64 = 1356998400000
 
-	var maxID uint64
+	var minID uint64
 	for _, set := range sets {
 		for id := range set {
 			var v uint64
 			_, err := fmt.Sscanf(id, "%d", &v)
-			if err != nil {
+			if err != nil || v == 0 {
 				continue
 			}
-			if v > maxID {
-				maxID = v
+			if minID == 0 || v < minID {
+				minID = v
 			}
 		}
 	}
 
-	if maxID == 0 {
+	if minID == 0 {
 		return 0
 	}
 
 	// 雪花 ID 右移 22 位得到相对 epoch 的毫秒偏移
-	msOffset := int64(maxID >> 22)
+	msOffset := int64(minID >> 22)
 	unixMs := xhsEpochMs + msOffset
-	return unixMs / 1000
+	// 额外往前多看 5 分钟，防止时钟误差或边界通知被漏掉
+	return unixMs/1000 - 300
 }
 
 // parseIDSet 将参数解析为 notification_id 的 set

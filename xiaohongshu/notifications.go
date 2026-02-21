@@ -197,7 +197,42 @@ func (n *NotificationsAction) GetUnprocessedNotifications(
 		for _, notif := range pageResult.Notifications {
 			id := notif.ID
 
+			// retry_ids 里的通知优先级最高：无论时间多旧，只要扫描到就必须包含
+			// 这保证了上次心跳超时/失败的通知在下次心跳一定会被重试
+			if retryIDs[id] {
+				consecutiveDone = 0 // 遇到待重试通知，重置连续计数
+				result.TotalRetry++
+				un := UnprocessedNotification{
+					NotificationID:  id,
+					RelationType:    notif.RelationType,
+					IsRetry:         true,
+					CommentID:       notif.CommentInfo.ID,
+					CommentContent:  notif.CommentInfo.Content,
+					ParentCommentID: notif.ParentCommentID,
+					UserID:          notif.UserInfo.UserID,
+					UserNickname:    notif.UserInfo.Nickname,
+					FeedID:          notif.ItemInfo.ID,
+					XsecToken:       notif.ItemInfo.XsecToken,
+					NoteTitle:       notif.ItemInfo.Content,
+					TimeUnix:        notif.Time,
+					TimeCST:         time.Unix(notif.Time, 0).In(cst).Format("2006-01-02 15:04"),
+				}
+				if notif.CommentInfo.TargetComment != nil {
+					un.TargetCommentID = notif.CommentInfo.TargetComment.ID
+					un.TargetCommentContent = notif.CommentInfo.TargetComment.Content
+					un.TargetCommentAuthor = notif.CommentInfo.TargetComment.UserInfo.Nickname
+				}
+				result.Notifications = append(result.Notifications, un)
+				if len(result.Notifications) >= maxResults {
+					result.HasMore = true
+					logrus.Infof("GetUnprocessedNotifications: 已达 maxResults=%d（含重试），停止扫描", maxResults)
+					goto done
+				}
+				continue
+			}
+
 			// 时间窗口过滤：通知按时间倒序，遇到超出时间窗口的通知，后面更旧的都不需要了
+			// 注意：retry_ids 已在上面单独处理，不受此限制
 			if sinceUnix > 0 && notif.Time < sinceUnix {
 				result.TotalTooOld++
 				logrus.Infof("GetUnprocessedNotifications: 通知 %s 时间 %d 早于 sinceUnix %d，停止扫描", id, notif.Time, sinceUnix)
@@ -217,17 +252,12 @@ func (n *NotificationsAction) GetUnprocessedNotifications(
 			// 重置连续计数
 			consecutiveDone = 0
 
-			isRetry := retryIDs[id]
-			if isRetry {
-				result.TotalRetry++
-			} else {
-				result.TotalNew++
-			}
+			result.TotalNew++
 
 			un := UnprocessedNotification{
 				NotificationID:  id,
 				RelationType:    notif.RelationType,
-				IsRetry:         isRetry,
+				IsRetry:         false,
 				CommentID:       notif.CommentInfo.ID,
 				CommentContent:  notif.CommentInfo.Content,
 				ParentCommentID: notif.ParentCommentID,

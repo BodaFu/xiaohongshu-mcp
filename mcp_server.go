@@ -121,7 +121,7 @@ type GetUnprocessedNotificationsArgs struct {
 	// 正常情况下接口会自动从 processed_ids 中最大的 notification_id 提取时间戳作为扫描起点，无需手动设置此参数。
 	SinceHours int `json:"since_hours,omitempty" jsonschema:"兜底时间窗口（小时，可选，默认48）。仅当 processed_ids 和 retry_ids 均为空时生效。正常情况下接口自动从已处理 ID 中推算扫描起点，无需设置"`
 	// MaxResults 单次最多返回多少条待处理通知（默认20）。超出时 has_more=true，需再次调用处理剩余
-	MaxResults int `json:"max_results,omitempty" jsonschema:"单次最多返回的待处理通知数量（可选，默认20）。防止返回过多导致输出截断。has_more=true 时需再次调用"`
+	MaxResults int `json:"max_results,omitempty" jsonschema:"单次最多返回的待处理通知数量（可选，默认20），防止返回过多导致输出截断，has_more为true时需再次调用"`
 }
 
 // InitMCPServer 初始化 MCP Server
