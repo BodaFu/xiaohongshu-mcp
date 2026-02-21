@@ -19,9 +19,10 @@ type commentPageAPIResponse struct {
 	Msg     string `json:"msg"`
 	Data    struct {
 		Comments []struct {
-			ID          string `json:"id"`
-			Content     string `json:"content"`
-			SubComments []struct {
+			ID              string `json:"id"`
+			Content         string `json:"content"`
+			SubCommentCount string `json:"sub_comment_count"` // 子评论总数（字符串格式）
+			SubComments     []struct {
 				ID      string `json:"id"`
 				Content string `json:"content"`
 			} `json:"sub_comments"`
@@ -37,8 +38,26 @@ type commentAPIEntry struct {
 	hasMore bool
 }
 
-// commentIDExistsInAPIEntries 检查 commentID 是否在已捕获的 API 响应中
-func commentIDExistsInAPIEntries(entries []commentAPIEntry, commentID string) bool {
+// commentIDCheckResult 检查 commentID 是否在已捕获的 API 响应中的结果
+type commentIDCheckResult int
+
+const (
+	// commentIDNotFound: 目标 ID 不在任何顶级评论或其预加载子评论中
+	commentIDNotFound commentIDCheckResult = iota
+	// commentIDFound: 目标 ID 已在 API 数据中找到（顶级或预加载子评论）
+	commentIDFound
+	// commentIDMaybeInSubComments: 目标 ID 不在预加载子评论中，但存在有更多子评论未加载的顶级评论
+	// 此时不能断定评论已删除，需要展开子评论后才能确认
+	commentIDMaybeInSubComments
+)
+
+// checkCommentIDInAPIEntries 检查 commentID 是否在已捕获的 API 响应中。
+// 返回三态结果：已找到、未找到（确认不存在）、可能在未展开的子评论中。
+// 关键：小红书 API 的 sub_comments 只预加载前几条子评论，不是全部。
+// 当 has_more=false 且目标 ID 不在预加载子评论里，但存在有子评论的顶级评论时，
+// 不能直接判断为已删除——目标可能是该顶级评论的深层子评论。
+func checkCommentIDInAPIEntries(entries []commentAPIEntry, commentID string) commentIDCheckResult {
+	hasPotentialParent := false
 	for _, entry := range entries {
 		var resp commentPageAPIResponse
 		if err := json.Unmarshal([]byte(entry.body), &resp); err != nil {
@@ -46,20 +65,65 @@ func commentIDExistsInAPIEntries(entries []commentAPIEntry, commentID string) bo
 		}
 		for _, c := range resp.Data.Comments {
 			if c.ID == commentID {
-				return true
+				return commentIDFound
 			}
 			for _, sub := range c.SubComments {
 				if sub.ID == commentID {
-					return true
+					return commentIDFound
 				}
+			}
+			// 该顶级评论有子评论但预加载不完整（sub_comment_count > len(sub_comments)）
+			// 目标 ID 可能在未预加载的子评论中
+			if c.SubCommentCount != "" && c.SubCommentCount != "0" && len(c.SubComments) == 0 {
+				hasPotentialParent = true
+			} else if len(c.SubComments) > 0 && c.SubCommentCount != "" {
+				// 有预加载但可能不完整（sub_comment_count > len(sub_comments)）
+				hasPotentialParent = true
 			}
 		}
 	}
-	return false
+	if hasPotentialParent {
+		return commentIDMaybeInSubComments
+	}
+	return commentIDNotFound
+}
+
+// commentIDExistsInAPIEntries 检查 commentID 是否在已捕获的 API 响应中（简化版，向后兼容）
+func commentIDExistsInAPIEntries(entries []commentAPIEntry, commentID string) bool {
+	return checkCommentIDInAPIEntries(entries, commentID) == commentIDFound
+}
+
+// getTopLevelCommentsWithSubComments 从 API 数据中找出所有有子评论的顶级评论 ID。
+// 用于当目标 commentID 可能是某个顶级评论的深层子评论时，逐一展开尝试。
+func getTopLevelCommentsWithSubComments(apiEntries *[]commentAPIEntry, apiMu *sync.Mutex) []string {
+	apiMu.Lock()
+	entries := make([]commentAPIEntry, len(*apiEntries))
+	copy(entries, *apiEntries)
+	apiMu.Unlock()
+
+	seen := make(map[string]bool)
+	var result []string
+	for _, entry := range entries {
+		var resp commentPageAPIResponse
+		if err := json.Unmarshal([]byte(entry.body), &resp); err != nil {
+			continue
+		}
+		for _, c := range resp.Data.Comments {
+			if seen[c.ID] {
+				continue
+			}
+			if c.SubCommentCount != "" && c.SubCommentCount != "0" {
+				seen[c.ID] = true
+				result = append(result, c.ID)
+			}
+		}
+	}
+	return result
 }
 
 // findParentCommentIDFromAPIEntries 在已捕获的评论 API 响应中查找某个 commentID 属于哪个顶级父评论。
 // 用于容错：当 parentCommentID 本身是子评论 ID 时，从 API 数据反查其真正的顶级父评论。
+// 返回值：(顶级父评论ID, 是否可能在未展开的子评论中)
 func findParentCommentIDFromAPIEntries(apiEntries *[]commentAPIEntry, apiMu *sync.Mutex, commentID string) string {
 	apiMu.Lock()
 	entries := make([]commentAPIEntry, len(*apiEntries))
@@ -297,7 +361,7 @@ func (f *CommentFeedAction) ReplyToComment(ctx context.Context, feedID, xsecToke
 		logrus.Infof("目标是子评论，先找父评论 %s，然后展开子评论列表", parentCommentID)
 		commentEl, err = findSubComment(page, parentCommentID, commentID, userID, &commentAPIEntries, &commentAPIMu)
 		if err != nil {
-			// 容错：parentCommentID 找不到，可能它本身是子评论（来自通知 API 的 target_comment_id）。
+			// 容错1：parentCommentID 找不到，可能它本身是子评论（来自通知 API 的 target_comment_id）。
 			// 小红书评论只有两层，尝试把 parentCommentID 当子评论 ID，从 API 数据中反查其顶级父评论。
 			// 使用带滚动的版本，确保 API 数据不足时能加载更多再重试。
 			logrus.Warnf("父评论 %s 未找到，尝试将其作为子评论 ID 反查顶级父评论（通知 API 的 target_comment_id 可能是子评论）", parentCommentID)
@@ -306,16 +370,59 @@ func (f *CommentFeedAction) ReplyToComment(ctx context.Context, feedID, xsecToke
 				commentEl, err = findSubComment(page, trueParentID, commentID, userID, &commentAPIEntries, &commentAPIMu)
 			}
 		}
+		if err != nil {
+			// 容错2：父评论路径全部失败。
+			// 先尝试从 API 数据中反查 commentID 的真正父评论（commentID 本身可能是子评论）。
+			logrus.Warnf("父评论路径全部失败，尝试从 API 数据中反查 %s 的真正父评论", commentID)
+			if foundParentID := findParentCommentIDWithScroll(page, &commentAPIEntries, &commentAPIMu, commentID); foundParentID != "" {
+				logrus.Infof("从API数据中发现 %s 是 %s 的子评论，切换到子评论查找路径", commentID, foundParentID)
+				commentEl, err = findSubComment(page, foundParentID, commentID, userID, &commentAPIEntries, &commentAPIMu)
+			}
+		}
+		if err != nil {
+			// 容错3：预加载子评论数据不完整，commentID 可能在某个顶级评论的深层子评论里。
+			// 遍历所有有子评论的顶级评论，逐一展开尝试找到目标。
+			logrus.Warnf("反查失败，遍历所有有子评论的顶级评论，逐一展开查找 %s", commentID)
+			topLevelIDs := getTopLevelCommentsWithSubComments(&commentAPIEntries, &commentAPIMu)
+			logrus.Infof("找到 %d 个有子评论的顶级评论，逐一展开", len(topLevelIDs))
+			for _, topID := range topLevelIDs {
+				logrus.Infof("尝试展开顶级评论 %s 查找子评论 %s", topID, commentID)
+				commentEl, err = findSubComment(page, topID, commentID, userID, &commentAPIEntries, &commentAPIMu)
+				if err == nil {
+					logrus.Infof("✓ 在顶级评论 %s 下找到目标子评论 %s", topID, commentID)
+					break
+				}
+			}
+		}
+		if err != nil {
+			// 容错4：所有子评论路径均失败，最后降级为直接查找 commentID 作为顶级评论处理。
+			// 此时回复会出现在评论区顶层，但至少能成功回复对方。
+			logrus.Warnf("所有子评论路径失败，最终降级：直接查找目标评论 %s 作为顶级评论处理", commentID)
+			commentEl, err = findCommentElementWithAPICheck(page, commentID, userID, &commentAPIEntries, &commentAPIMu)
+		}
 	} else {
 		commentEl, err = findCommentElementWithAPICheck(page, commentID, userID, &commentAPIEntries, &commentAPIMu)
 		if err != nil && commentID != "" {
-			// 容错：顶级评论中没找到，可能是子评论但调用方未传 parentCommentID。
+			// 容错1：顶级评论中没找到，可能是子评论但调用方未传 parentCommentID。
 			// 尝试从 API 数据中查找 commentID 所在的父评论，然后走子评论路径。
-			// 使用带滚动的版本，确保 API 数据不足时能加载更多再重试。
 			logrus.Warnf("顶级评论未找到 %s，尝试在API数据中搜索其父评论（调用方可能遗漏了 parent_comment_id）", commentID)
 			if foundParentID := findParentCommentIDWithScroll(page, &commentAPIEntries, &commentAPIMu, commentID); foundParentID != "" {
 				logrus.Infof("从API数据中发现 %s 是 %s 的子评论，切换到子评论查找路径", commentID, foundParentID)
 				commentEl, err = findSubComment(page, foundParentID, commentID, userID, &commentAPIEntries, &commentAPIMu)
+			}
+		}
+		if err != nil && commentID != "" {
+			// 容错2：预加载子评论数据不完整，遍历所有有子评论的顶级评论逐一展开。
+			logrus.Warnf("反查失败，遍历所有有子评论的顶级评论，逐一展开查找 %s", commentID)
+			topLevelIDs := getTopLevelCommentsWithSubComments(&commentAPIEntries, &commentAPIMu)
+			logrus.Infof("找到 %d 个有子评论的顶级评论，逐一展开", len(topLevelIDs))
+			for _, topID := range topLevelIDs {
+				logrus.Infof("尝试展开顶级评论 %s 查找子评论 %s", topID, commentID)
+				commentEl, err = findSubComment(page, topID, commentID, userID, &commentAPIEntries, &commentAPIMu)
+				if err == nil {
+					logrus.Infof("✓ 在顶级评论 %s 下找到目标子评论 %s", topID, commentID)
+					break
+				}
 			}
 		}
 	}
@@ -385,7 +492,8 @@ func (f *CommentFeedAction) ReplyToComment(ctx context.Context, feedID, xsecToke
 func findCommentElementWithAPICheck(page *rod.Page, commentID, userID string, apiEntries *[]commentAPIEntry, apiMu *sync.Mutex) (*rod.Element, error) {
 	logrus.Infof("开始查找评论 - commentID: %s, userID: %s", commentID, userID)
 
-	const maxScrollRounds = 15
+	// 主要终止条件是 API has_more=false，maxScrollRounds 只是安全上限防止无限循环
+	const maxScrollRounds = 100
 	const scrollInterval = 500 * time.Millisecond
 
 	// 先滚动到评论区
@@ -416,12 +524,15 @@ func findCommentElementWithAPICheck(page *rod.Page, commentID, userID string, ap
 
 		if len(initialEntries) > 0 {
 			logrus.Infof("预检：已有 %d 批API数据，开始检查", len(initialEntries))
-			if commentIDExistsInAPIEntries(initialEntries, commentID) {
+			switch checkCommentIDInAPIEntries(initialEntries, commentID) {
+			case commentIDFound:
 				logrus.Infof("✓ 预检API数据中找到 commentID=%s，进入DOM定位", commentID)
-			} else {
+			case commentIDMaybeInSubComments:
+				logrus.Infof("预检：commentID=%s 不在预加载子评论中，但存在有子评论的顶级评论，需展开后确认", commentID)
+			default: // commentIDNotFound
 				lastHasMore := initialEntries[len(initialEntries)-1].hasMore
 				if !lastHasMore {
-					logrus.Infof("API确认：评论API已无更多页，commentID=%s 不存在（已删除）", commentID)
+					logrus.Infof("API确认：评论API已无更多页且无未展开子评论，commentID=%s 不存在（已删除）", commentID)
 					return nil, fmt.Errorf("评论不存在（已被删除或不可见）: commentID=%s", commentID)
 				}
 				logrus.Infof("预检API数据未找到，评论可能在后续页，进入滚动查找（最多 %d 轮）", maxScrollRounds)
@@ -467,13 +578,17 @@ func findCommentElementWithAPICheck(page *rod.Page, commentID, userID string, ap
 					len(currentEntries)-lastAPICount, len(currentEntries), commentID)
 				lastAPICount = len(currentEntries)
 
-				if commentIDExistsInAPIEntries(currentEntries, commentID) {
+				switch checkCommentIDInAPIEntries(currentEntries, commentID) {
+				case commentIDFound:
 					logrus.Infof("✓ API数据确认评论存在，继续DOM定位")
 					// 评论存在，继续 DOM 滚动查找，不提前终止
-				} else {
+				case commentIDMaybeInSubComments:
+					logrus.Infof("API：commentID=%s 不在预加载子评论中，但存在有子评论的顶级评论，继续滚动", commentID)
+					// 不终止，继续滚动——目标可能在某个顶级评论的子评论里
+				default: // commentIDNotFound
 					lastHasMore := currentEntries[len(currentEntries)-1].hasMore
 					if !lastHasMore {
-						logrus.Infof("API确认：所有评论页已加载完毕，commentID=%s 不存在（已删除）", commentID)
+						logrus.Infof("API确认：所有评论页已加载完毕且无未展开子评论，commentID=%s 不存在（已删除）", commentID)
 						return nil, fmt.Errorf("评论不存在（已被删除或不可见）: commentID=%s", commentID)
 					}
 				}

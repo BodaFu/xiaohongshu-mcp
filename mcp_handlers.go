@@ -823,151 +823,27 @@ func (s *AppServer) handleGetNotifications(ctx context.Context, args map[string]
 
 // handleGetUnprocessedNotifications 获取需要处理的通知（自动翻页+去重）
 // 参数：
-//   - processed_ids: 已完成的 notification_id 列表（JSON 数组字符串或逗号分隔）
-//   - retry_ids: 待重试的 notification_id 列表
+//   - processed_ids: 已彻底完成的 notification_id 列表（已回复/已跳过），这些通知会被跳过
+//   - retry_ids: 上次超时/报错待重试的 notification_id 列表（retry_reason=timeout）
+//   - deleted_ids: 上次标记为已删除需重新确认的 notification_id 列表（retry_reason=deleted_recheck）
 //   - max_pages: 最多扫描页数（默认3，全量补漏时传更大值）
 //   - full_scan: true 时扫满 max_pages 页不提前停止（用于全量补漏扫描）
-//   - since_hours: 只返回最近 N 小时内的通知（默认48），防止旧通知重复返回
+//   - since_hours: 兜底时间窗口（默认48小时），仅当所有 ID 列表均为空时生效
 //   - max_results: 单次最多返回多少条（默认20），防止输出截断
-func (s *AppServer) handleGetUnprocessedNotifications(ctx context.Context, args map[string]interface{}) *MCPToolResult {
-	processedIDs := parseIDSet(args["processed_ids"])
-	retryIDs := parseIDSet(args["retry_ids"])
-
-	maxPagesFloat, _ := args["max_pages"].(float64)
-	maxPages := int(maxPagesFloat)
-	if maxPages <= 0 {
-		maxPages = 3
-	}
-
-	stopAfterConsecutive := 5
-	fullScan, _ := args["full_scan"].(bool)
-	if fullScan {
-		stopAfterConsecutive = 999999
-	}
-
-	// sinceUnix 从 processed_ids 和 retry_ids 里取最大的 notification_id（雪花 ID），
-	// 提取其中的时间戳作为扫描起点——只返回这条最新已处理通知之后的通知。
-	// 这样即使记录文件被清理，也不会因为旧 ID 消失而把大量旧通知误判为未处理。
-	// 如果两个集合都为空（首次运行），退回到 since_hours 参数（默认 48 小时）。
-	sinceHoursFloat, _ := args["since_hours"].(float64)
-	sinceHours := int(sinceHoursFloat)
-	if sinceHours <= 0 {
-		sinceHours = 48
-	}
-	sinceUnix := extractSinceUnixFromIDs(processedIDs, retryIDs)
-	if sinceUnix == 0 {
-		// processed_ids 和 retry_ids 均为空（首次运行），退回到 since_hours 兜底
-		sinceUnix = time.Now().Unix() - int64(sinceHours)*3600
-	}
-
-	maxResultsFloat, _ := args["max_results"].(float64)
-	maxResults := int(maxResultsFloat)
-	if maxResults <= 0 {
-		maxResults = 20
-	}
-
-	logrus.Infof("MCP: 获取未处理通知 - processed=%d, retry=%d, maxPages=%d, fullScan=%v, sinceUnix=%d, maxResults=%d",
-		len(processedIDs), len(retryIDs), maxPages, fullScan, sinceUnix, maxResults)
-
-	result, err := s.xiaohongshuService.GetUnprocessedNotifications(ctx, processedIDs, retryIDs, maxPages, stopAfterConsecutive, sinceUnix, maxResults)
-	if err != nil {
-		return &MCPToolResult{
-			Content: []MCPContent{{Type: "text", Text: "获取通知失败: " + err.Error()}},
-			IsError: true,
-		}
-	}
-
-	// 找出 retry_ids 里在本次扫描中未出现的 ID（可能超出翻页范围或通知已消失）
-	// 这些 ID 需要单独告知 Liko，让她决定是继续重试还是标记为已跳过
-	seenIDs := make(map[string]bool)
-	for _, n := range result.Notifications {
-		seenIDs[n.NotificationID] = true
-	}
-	var missingRetryIDs []string
-	for id := range retryIDs {
-		if !seenIDs[id] {
-			missingRetryIDs = append(missingRetryIDs, id)
-		}
-	}
-
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("扫描完成：共扫描 %d 页 %d 条通知，跳过已完成 %d 条，过滤超时窗口 %d 条，待处理 %d 条（全新 %d + 待重试 %d）\n",
-		result.PagesScanned, result.TotalScanned, result.TotalSkipped, result.TotalTooOld,
-		result.TotalNew+result.TotalRetry, result.TotalNew, result.TotalRetry))
-	if result.HasMore {
-		sb.WriteString("⚠️ 待处理通知超过单次返回上限，本次仅返回部分。处理完后请再次调用获取剩余通知。\n")
-	}
-	if len(missingRetryIDs) > 0 {
-		sb.WriteString(fmt.Sprintf("⚠️ 以下 %d 个待重试通知在本次扫描范围内未找到（可能已超出翻页范围或通知已消失），请酌情标记为已跳过：\n", len(missingRetryIDs)))
-		for _, id := range missingRetryIDs {
-			sb.WriteString(fmt.Sprintf("  - %s\n", id))
-		}
-	}
-	sb.WriteString("\n")
-
-	if len(result.Notifications) == 0 {
-		sb.WriteString("✅ 没有需要处理的通知")
-		return &MCPToolResult{
-			Content: []MCPContent{{Type: "text", Text: sb.String()}},
-		}
-	}
-
-	for i, n := range result.Notifications {
-		tag := "全新"
-		if n.IsRetry {
-			tag = "待重试"
-		}
-
-		var relationLabel string
-		switch n.RelationType {
-		case xiaohongshu.RelationCommentOnMyNote:
-			relationLabel = "评论了我的笔记"
-		case xiaohongshu.RelationReplyToMyComment:
-			relationLabel = "回复了我的评论"
-		case xiaohongshu.RelationAtOthersUnderMyComment:
-			relationLabel = "在我的评论下@了他人"
-		case xiaohongshu.RelationMentionedMe:
-			relationLabel = "在评论中@了我"
-		default:
-			relationLabel = string(n.RelationType)
-		}
-
-		sb.WriteString(fmt.Sprintf("--- 待处理通知 %d [%s][%s] ---\n", i+1, tag, relationLabel))
-		sb.WriteString(fmt.Sprintf("notification_id: %s\n", n.NotificationID))
-		sb.WriteString(fmt.Sprintf("时间: %s\n", n.TimeCST))
-		sb.WriteString(fmt.Sprintf("用户: %s (user_id: %s)\n", n.UserNickname, n.UserID))
-		sb.WriteString(fmt.Sprintf("评论内容: %s\n", n.CommentContent))
-		sb.WriteString(fmt.Sprintf("comment_id: %s\n", n.CommentID))
-
-		if n.ParentCommentID != "" {
-			sb.WriteString(fmt.Sprintf("parent_comment_id: %s\n", n.ParentCommentID))
-		}
-		if n.TargetCommentContent != "" {
-			sb.WriteString(fmt.Sprintf("被回复的评论: [%s] %s\n",
-				n.TargetCommentAuthor, truncate(n.TargetCommentContent, 60)))
-		}
-
-		sb.WriteString(fmt.Sprintf("笔记: %s\n", truncate(n.NoteTitle, 40)))
-		sb.WriteString(fmt.Sprintf("feed_id: %s\n", n.FeedID))
-		sb.WriteString(fmt.Sprintf("xsec_token: %s\n", n.XsecToken))
-		sb.WriteString("\n")
-	}
-
-	return &MCPToolResult{
-		Content: []MCPContent{{Type: "text", Text: sb.String()}},
-	}
-}
-
-// extractSinceUnixFromIDs 从 processed_ids / retry_ids 中提取最小雪花 ID 对应的 Unix 时间戳（秒）。
+// extractSinceUnixFromIDs 从 processed_ids 中提取最小雪花 ID 对应的 Unix 时间戳（秒）。
 // 小红书雪花 ID 高 41 位是毫秒时间戳（相对于 2013-01-01 00:00:00 UTC 的偏移）。
 //
 // 取最小 ID（最早的已处理通知）对应的时间作为扫描起点下界，确保所有已处理通知都在扫描窗口内，
 // 从而保证去重逻辑能正确过滤掉已处理的通知，防止重复回复。
 //
-// 如果所有集合都为空（首次运行），返回 0，调用方退回 since_hours 兜底。
+// 注意：只传入 processedIDs，不传 retryIDs/deletedIDs——后两者不受时间窗口限制，
+// 纳入计算只会把窗口拉得更早，增加不必要的扫描量。
+//
+// 如果 processedIDs 为空（首次运行），返回 0，调用方退回 since_hours 兜底。
 func extractSinceUnixFromIDs(sets ...map[string]bool) int64 {
-	// 小红书雪花 ID epoch：2013-01-01 00:00:00 UTC（毫秒）
-	const xhsEpochMs int64 = 1356998400000
+	// 小红书 notification_id 高位直接编码 Unix 秒时间戳：
+	// notification_id >> 32 = Unix 时间戳（秒）
+	// 注意：这与标准雪花 ID（>>22 + epoch）不同，小红书 notification_id 是自有格式。
 
 	var minID uint64
 	for _, set := range sets {
@@ -987,41 +863,9 @@ func extractSinceUnixFromIDs(sets ...map[string]bool) int64 {
 		return 0
 	}
 
-	// 雪花 ID 右移 22 位得到相对 epoch 的毫秒偏移
-	msOffset := int64(minID >> 22)
-	unixMs := xhsEpochMs + msOffset
-	// 额外往前多看 5 分钟，防止时钟误差或边界通知被漏掉
-	return unixMs/1000 - 300
-}
-
-// parseIDSet 将参数解析为 notification_id 的 set
-// 支持两种格式：
-//   - []interface{}（JSON 数组）
-//   - string（逗号分隔）
-func parseIDSet(v interface{}) map[string]bool {
-	result := make(map[string]bool)
-	if v == nil {
-		return result
-	}
-	switch val := v.(type) {
-	case []interface{}:
-		for _, item := range val {
-			if s, ok := item.(string); ok && s != "" {
-				result[s] = true
-			}
-		}
-	case string:
-		if val == "" {
-			return result
-		}
-		for _, id := range strings.Split(val, ",") {
-			id = strings.TrimSpace(id)
-			if id != "" {
-				result[id] = true
-			}
-		}
-	}
-	return result
+	// 右移 32 位得到 Unix 秒时间戳，额外往前多看 5 分钟防止边界漏掉
+	unixSec := int64(minID >> 32)
+	return unixSec - 300
 }
 
 // truncate 截断字符串到指定长度
@@ -1031,4 +875,341 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return string(runes[:n]) + "..."
+}
+
+// handleNotificationsGetPending 获取待处理通知列表（从 DB + 实时扫描合并）
+func (s *AppServer) handleNotificationsGetPending(ctx context.Context, args NotificationsGetPendingArgs) *MCPToolResult {
+	store, err := GetNotificationStore()
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "初始化状态数据库失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+
+	// 自动跳过重试次数过多的通知
+	skipped, err := store.AutoSkipExcessiveRetries(5)
+	if err != nil {
+		logrus.Warnf("AutoSkipExcessiveRetries 失败: %v", err)
+	} else if skipped > 0 {
+		logrus.Infof("自动跳过 %d 条重试次数超限的通知", skipped)
+	}
+
+	// 从 DB 读取各状态 ID 集合
+	processedIDs, err := store.GetProcessedIDs()
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "读取已处理 ID 失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+	retryIDs, err := store.GetRetryIDs()
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "读取重试 ID 失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+	deletedCheckIDs, err := store.GetDeletedCheckIDs()
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "读取待确认 ID 失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+
+	// 计算扫描起点：从 processedIDs 中最小雪花 ID 推算，或退回 since_hours
+	sinceHours := args.SinceHours
+	if sinceHours <= 0 {
+		sinceHours = 48
+	}
+	maxPages := args.MaxPages
+	if maxPages <= 0 {
+		maxPages = 5
+	}
+	maxResults := args.MaxResults
+	if maxResults <= 0 {
+		maxResults = 20
+	}
+	stopAfterConsecutive := 5
+	if args.FullScan {
+		stopAfterConsecutive = 999999
+	}
+
+	sinceUnix := extractSinceUnixFromIDs(processedIDs)
+	if sinceUnix == 0 {
+		// 首次运行或 DB 为空，用 last_fetch_time 兜底
+		lastFetch, _ := store.GetLastFetchTime()
+		if lastFetch > 0 {
+			sinceUnix = lastFetch - 300
+		} else {
+			sinceUnix = time.Now().Unix() - int64(sinceHours)*3600
+		}
+	}
+
+	logrus.Infof("notifications.get_pending: processed=%d, retry=%d, deleted_check=%d, maxPages=%d, sinceUnix=%d",
+		len(processedIDs), len(retryIDs), len(deletedCheckIDs), maxPages, sinceUnix)
+
+	// 调用底层扫描
+	result, err := s.xiaohongshuService.GetUnprocessedNotifications(
+		ctx, processedIDs, retryIDs, deletedCheckIDs,
+		maxPages, stopAfterConsecutive, sinceUnix, maxResults,
+	)
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "扫描通知失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+
+	// 将扫描到的全新通知写入 DB（INSERT OR IGNORE，不覆盖已有状态）
+	var newRecords []NotificationRecord
+	for _, n := range result.Notifications {
+		if n.RetryReason == xiaohongshu.RetryReasonNone {
+			newRecords = append(newRecords, NotificationRecord{
+				ID:              n.NotificationID,
+				FeedID:          n.FeedID,
+				XsecToken:       n.XsecToken,
+				CommentID:       n.CommentID,
+				ParentCommentID: n.ParentCommentID,
+				CommentContent:  n.CommentContent,
+				UserID:          n.UserID,
+				UserNickname:    n.UserNickname,
+				NoteTitle:       n.NoteTitle,
+				RelationType:    string(n.RelationType),
+				NotifTimeUnix:   n.TimeUnix,
+			})
+		}
+	}
+	if len(newRecords) > 0 {
+		if err := store.UpsertNotifications(newRecords); err != nil {
+			logrus.Warnf("写入新通知到 DB 失败: %v", err)
+		}
+	}
+
+	// 更新 last_fetch_time 为本次扫描到的最新通知时间
+	if len(result.Notifications) > 0 {
+		latestTime := result.Notifications[0].TimeUnix
+		if latestTime > 0 {
+			_ = store.SetLastFetchTime(latestTime)
+		}
+	}
+
+	// 从 DB 读取所有待处理记录（pending/retry/deleted_check），
+	// 与扫描结果合并——确保即使扫描页数不足，DB 里的旧 pending 也不会丢失。
+	dbPendingRecords, err := store.GetPendingRecords()
+	if err != nil {
+		logrus.Warnf("读取 DB pending 记录失败: %v", err)
+	}
+
+	// 以扫描结果为基础，补充 DB 里有但扫描未覆盖到的 pending 记录
+	scannedIDs := make(map[string]bool)
+	for _, n := range result.Notifications {
+		scannedIDs[n.NotificationID] = true
+	}
+
+	// 构建最终输出列表：先放扫描结果，再追加 DB 里未被扫描覆盖的旧 pending
+	type outputEntry struct {
+		fromScan bool
+		scan     xiaohongshu.UnprocessedNotification
+		db       NotificationRecord
+	}
+	var entries []outputEntry
+	for _, n := range result.Notifications {
+		entries = append(entries, outputEntry{fromScan: true, scan: n})
+	}
+	var dbOnlyCount int
+	for _, r := range dbPendingRecords {
+		if !scannedIDs[r.ID] {
+			entries = append(entries, outputEntry{fromScan: false, db: r})
+			dbOnlyCount++
+		}
+	}
+
+	logrus.Infof("notifications.get_pending: 扫描返回 %d 条，DB 补充 %d 条旧 pending，合计 %d 条",
+		len(result.Notifications), dbOnlyCount, len(entries))
+
+	// 构建输出
+	var sb strings.Builder
+	total := result.TotalNew + result.TotalRetry + result.TotalDeletedRecheck
+	sb.WriteString(fmt.Sprintf("扫描完成：%d 页 %d 条，跳过已完成 %d 条，扫描待处理 %d 条（全新 %d + 重试 %d + 删除重确认 %d）",
+		result.PagesScanned, result.TotalScanned, result.TotalSkipped,
+		total, result.TotalNew, result.TotalRetry, result.TotalDeletedRecheck))
+	if dbOnlyCount > 0 {
+		sb.WriteString(fmt.Sprintf("，DB补充旧pending %d 条", dbOnlyCount))
+	}
+	sb.WriteString("\n")
+
+	if result.HasMore {
+		sb.WriteString("⚠️ 扫描到的待处理通知超过单次返回上限，处理完后请再次调用。\n")
+	}
+	sb.WriteString("\n")
+
+	if len(entries) == 0 {
+		sb.WriteString("✅ 没有需要处理的通知。")
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: sb.String()}},
+		}
+	}
+
+	for i, e := range entries {
+		if e.fromScan {
+			n := e.scan
+			var tag string
+			switch n.RetryReason {
+			case xiaohongshu.RetryReasonTimeout:
+				tag = "重试"
+			case xiaohongshu.RetryReasonDeletedRecheck:
+				tag = "删除重确认"
+			default:
+				tag = "全新"
+			}
+			var relationLabel string
+			switch n.RelationType {
+			case xiaohongshu.RelationCommentOnMyNote:
+				relationLabel = "评论了我的笔记"
+			case xiaohongshu.RelationReplyToMyComment:
+				relationLabel = "回复了我的评论"
+			case xiaohongshu.RelationAtOthersUnderMyComment:
+				relationLabel = "在我的评论下@了他人"
+			case xiaohongshu.RelationMentionedMe:
+				relationLabel = "在评论中@了我"
+			default:
+				relationLabel = string(n.RelationType)
+			}
+			sb.WriteString(fmt.Sprintf("--- 通知 %d [%s][%s] ---\n", i+1, tag, relationLabel))
+			sb.WriteString(fmt.Sprintf("notification_id: %s\n", n.NotificationID))
+			sb.WriteString(fmt.Sprintf("时间: %s\n", n.TimeCST))
+			sb.WriteString(fmt.Sprintf("用户: %s (user_id: %s)\n", n.UserNickname, n.UserID))
+			sb.WriteString(fmt.Sprintf("评论: %s\n", n.CommentContent))
+			sb.WriteString(fmt.Sprintf("comment_id: %s\n", n.CommentID))
+			if n.ParentCommentID != "" {
+				sb.WriteString(fmt.Sprintf("parent_comment_id: %s\n", n.ParentCommentID))
+			}
+			if n.TargetCommentContent != "" {
+				sb.WriteString(fmt.Sprintf("被回复的评论: [%s] %s\n",
+					n.TargetCommentAuthor, truncate(n.TargetCommentContent, 60)))
+			}
+			sb.WriteString(fmt.Sprintf("笔记: %s\n", truncate(n.NoteTitle, 40)))
+			sb.WriteString(fmt.Sprintf("feed_id: %s\n", n.FeedID))
+			sb.WriteString(fmt.Sprintf("xsec_token: %s\n", n.XsecToken))
+		} else {
+			r := e.db
+			var tag string
+			switch r.Status {
+			case StatusRetry:
+				tag = "重试"
+			case StatusDeletedCheck:
+				tag = "删除重确认"
+			default:
+				tag = "pending"
+			}
+			timeCST := time.Unix(r.NotifTimeUnix, 0).In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04")
+			sb.WriteString(fmt.Sprintf("--- 通知 %d [%s][DB补充][%s] ---\n", i+1, tag, r.RelationType))
+			sb.WriteString(fmt.Sprintf("notification_id: %s\n", r.ID))
+			sb.WriteString(fmt.Sprintf("时间: %s\n", timeCST))
+			sb.WriteString(fmt.Sprintf("用户: %s (user_id: %s)\n", r.UserNickname, r.UserID))
+			sb.WriteString(fmt.Sprintf("评论: %s\n", r.CommentContent))
+			sb.WriteString(fmt.Sprintf("comment_id: %s\n", r.CommentID))
+			if r.ParentCommentID != "" {
+				sb.WriteString(fmt.Sprintf("parent_comment_id: %s\n", r.ParentCommentID))
+			}
+			sb.WriteString(fmt.Sprintf("笔记: %s\n", truncate(r.NoteTitle, 40)))
+			sb.WriteString(fmt.Sprintf("feed_id: %s\n", r.FeedID))
+			sb.WriteString(fmt.Sprintf("xsec_token: %s\n", r.XsecToken))
+		}
+		sb.WriteString("\n")
+	}
+
+	return &MCPToolResult{
+		Content: []MCPContent{{Type: "text", Text: sb.String()}},
+	}
+}
+
+// handleNotificationsMarkResult 标记通知处理结果
+func (s *AppServer) handleNotificationsMarkResult(ctx context.Context, args NotificationsMarkResultArgs) *MCPToolResult {
+	if args.NotificationID == "" {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "缺少 notification_id"}},
+			IsError: true,
+		}
+	}
+
+	store, err := GetNotificationStore()
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "初始化状态数据库失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+
+	var status NotificationStatus
+	switch args.Status {
+	case "replied":
+		status = StatusReplied
+	case "skipped":
+		status = StatusSkipped
+	case "retry":
+		status = StatusRetry
+	case "deleted_check":
+		status = StatusDeletedCheck
+	default:
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: fmt.Sprintf("无效的 status: %q，合法值：replied / skipped / retry / deleted_check", args.Status)}},
+			IsError: true,
+		}
+	}
+
+	if err := store.MarkResult(args.NotificationID, status, args.ReplyContent); err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "更新状态失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+
+	logrus.Infof("notifications.mark_result: id=%s status=%s", args.NotificationID, status)
+
+	return &MCPToolResult{
+		Content: []MCPContent{{Type: "text", Text: fmt.Sprintf("✅ 通知 %s 已标记为 %s", args.NotificationID, status)}},
+	}
+}
+
+// handleNotificationsStats 返回通知状态统计
+func (s *AppServer) handleNotificationsStats(ctx context.Context) *MCPToolResult {
+	store, err := GetNotificationStore()
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "初始化状态数据库失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+
+	stats, err := store.Stats()
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "读取统计失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+
+	lastFetch, _ := store.GetLastFetchTime()
+	var lastFetchStr string
+	if lastFetch > 0 {
+		lastFetchStr = time.Unix(lastFetch, 0).In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04:05")
+	} else {
+		lastFetchStr = "从未"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("通知状态统计：\n")
+	sb.WriteString(fmt.Sprintf("  待处理 (pending):      %d\n", stats["pending"]))
+	sb.WriteString(fmt.Sprintf("  待重试 (retry):        %d\n", stats["retry"]))
+	sb.WriteString(fmt.Sprintf("  删除待确认 (deleted_check): %d\n", stats["deleted_check"]))
+	sb.WriteString(fmt.Sprintf("  已回复 (replied):      %d\n", stats["replied"]))
+	sb.WriteString(fmt.Sprintf("  已跳过 (skipped):      %d\n", stats["skipped"]))
+	sb.WriteString(fmt.Sprintf("上次拉取时间: %s\n", lastFetchStr))
+
+	return &MCPToolResult{
+		Content: []MCPContent{{Type: "text", Text: sb.String()}},
+	}
 }

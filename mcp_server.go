@@ -107,22 +107,21 @@ type GetNotificationsArgs struct {
 	SinceUnix int64  `json:"since_unix,omitempty" jsonschema:"（可选）只返回此 Unix 时间戳（秒）之后的通知，自动翻页汇总所有符合条件的通知。例如 1771200000"`
 }
 
-// GetUnprocessedNotificationsArgs 获取未处理通知的参数
-type GetUnprocessedNotificationsArgs struct {
-	// ProcessedIDs 已完成处理的 notification_id 列表（状态为已回复/已删除/已跳过）
-	ProcessedIDs []string `json:"processed_ids,omitempty" jsonschema:"已完成处理的 notification_id 列表，这些通知会被跳过"`
-	// RetryIDs 待重试的 notification_id 列表（状态为待重试，需重新处理）
-	RetryIDs []string `json:"retry_ids,omitempty" jsonschema:"待重试的 notification_id 列表，这些通知会被包含在返回结果中（is_retry=true）"`
-	// MaxPages 最多扫描几页（默认3）
-	MaxPages int `json:"max_pages,omitempty" jsonschema:"最多扫描的页数（可选，默认3）。全量补漏扫描时可传更大值"`
-	// FullScan 是否全量扫描（不提前停止，扫满 max_pages 页）
-	FullScan bool `json:"full_scan,omitempty" jsonschema:"是否全量扫描（可选，默认false）。true 时扫满 max_pages 页不提前停止，用于每10次心跳的全量补漏扫描"`
-	// SinceHours 兜底时间窗口（小时，默认48）。仅当 processed_ids 和 retry_ids 均为空时生效（首次运行）。
-	// 正常情况下接口会自动从 processed_ids 中最大的 notification_id 提取时间戳作为扫描起点，无需手动设置此参数。
-	SinceHours int `json:"since_hours,omitempty" jsonschema:"兜底时间窗口（小时，可选，默认48）。仅当 processed_ids 和 retry_ids 均为空时生效。正常情况下接口自动从已处理 ID 中推算扫描起点，无需设置"`
-	// MaxResults 单次最多返回多少条待处理通知（默认20）。超出时 has_more=true，需再次调用处理剩余
-	MaxResults int `json:"max_results,omitempty" jsonschema:"单次最多返回的待处理通知数量（可选，默认20），防止返回过多导致输出截断，has_more为true时需再次调用"`
+// NotificationsGetPendingArgs notifications.get_pending 的参数
+type NotificationsGetPendingArgs struct {
+	MaxPages   int  `json:"max_pages,omitempty" jsonschema:"最多扫描的页数，可选，默认5"`
+	FullScan   bool `json:"full_scan,omitempty" jsonschema:"是否全量扫描，可选，默认false，true时扫满max_pages页不提前停止"`
+	SinceHours int  `json:"since_hours,omitempty" jsonschema:"兜底时间窗口小时数，可选，默认48，仅当数据库为空时生效"`
+	MaxResults int  `json:"max_results,omitempty" jsonschema:"单次最多返回的待处理通知数量，可选，默认20"`
 }
+
+// NotificationsMarkResultArgs notifications.mark_result 的参数
+type NotificationsMarkResultArgs struct {
+	NotificationID string `json:"notification_id" jsonschema:"通知 ID，必填"`
+	Status         string `json:"status" jsonschema:"处理结果，必填，合法值：replied已回复、skipped已跳过、retry待重试、deleted_check删除待确认"`
+	ReplyContent   string `json:"reply_content,omitempty" jsonschema:"回复内容，可选，status为replied时填写"`
+}
+
 
 // InitMCPServer 初始化 MCP Server
 func InitMCPServer(appServer *AppServer) *mcp.Server {
@@ -492,44 +491,73 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 		}),
 	)
 
-	// 工具 15: 获取需要处理的通知（自动翻页+去重，专为 Liko 心跳设计）
+	// 工具 15: notifications.get_pending — 获取待处理通知（DB 状态驱动，专为 Liko 心跳设计）
 	mcp.AddTool(server,
 		&mcp.Tool{
-			Name: "get_unprocessed_notifications",
-			Description: "获取需要处理的小红书通知（自动翻页+去重+时间窗口过滤）。\n" +
-				"传入已完成处理的 notification_id 列表（processed_ids）和待重试的列表（retry_ids），\n" +
-				"接口内部自动翻页扫描，直接返回需要处理的通知列表，无需调用方手动翻页。\n\n" +
-				"返回的每条通知包含回复所需的全部字段：\n" +
-				"  - notification_id, relation_type, is_retry（是否为重试）\n" +
+			Name: "notifications_get_pending",
+			Description: "获取待处理的小红书通知（评论和@）。\n" +
+				"状态由 MCP 内部 SQLite 数据库管理，无需 Liko 传入任何 ID 列表。\n\n" +
+				"工作流程：\n" +
+				"  1. 从数据库读取 processed/retry/deleted_check 状态\n" +
+				"  2. 自动翻页扫描小红书通知，合并全新通知写入数据库\n" +
+				"  3. 返回所有待处理通知（全新 + 待重试 + 删除待确认）\n\n" +
+				"返回的每条通知包含：\n" +
+				"  - notification_id（处理完后必须调用 notifications_mark_result 标记）\n" +
+				"  - relation_type：comment_on_my_note / reply_to_my_comment / at_others_under_my_comment / mentioned_me\n" +
+				"  - retry_reason：\"\"=全新，\"timeout\"=重试，\"deleted_recheck\"=删除待确认\n" +
 				"  - comment_id, comment_content, parent_comment_id（子评论必填）\n" +
-				"  - target_comment_*（被回复的评论，reply_to_my_comment 类型时有）\n" +
-				"  - user_id, user_nickname\n" +
-				"  - feed_id, xsec_token, note_title（调用 reply_comment_in_feed 和 get_feed_detail 均需要）\n" +
-				"  - time_cst（北京时间字符串）\n\n" +
-				"关键参数：\n" +
-				"  - since_hours（默认48，兜底参数）：仅当 processed_ids/retry_ids 均为空时生效；正常情况下接口自动从最大已处理 ID 推算扫描起点\n" +
-				"  - max_results（默认20）：单次最多返回条数，防止输出过大被截断；has_more=true 时需再次调用\n" +
-				"翻页停止条件：连续遇到 5 条已完成通知时停止（full_scan=true 时扫满 max_pages 页）。",
+				"  - user_id, user_nickname, feed_id, xsec_token, note_title\n\n" +
+				"每次心跳必须对每条通知调用 notifications_mark_result 标记处理结果，否则下次心跳会重复返回。",
 			Annotations: &mcp.ToolAnnotations{
-				Title:        "Get Unprocessed Notifications",
-				ReadOnlyHint: true,
+				Title:        "Get Pending Notifications",
+				ReadOnlyHint: false,
 			},
 		},
-		withPanicRecovery("get_unprocessed_notifications", func(ctx context.Context, req *mcp.CallToolRequest, args GetUnprocessedNotificationsArgs) (*mcp.CallToolResult, any, error) {
-			argsMap := map[string]interface{}{
-				"processed_ids": args.ProcessedIDs,
-				"retry_ids":     args.RetryIDs,
-				"max_pages":     float64(args.MaxPages),
-				"full_scan":     args.FullScan,
-				"since_hours":   float64(args.SinceHours),
-				"max_results":   float64(args.MaxResults),
-			}
-			result := appServer.handleGetUnprocessedNotifications(ctx, argsMap)
+		withPanicRecovery("notifications_get_pending", func(ctx context.Context, req *mcp.CallToolRequest, args NotificationsGetPendingArgs) (*mcp.CallToolResult, any, error) {
+			result := appServer.handleNotificationsGetPending(ctx, args)
 			return convertToMCPResult(result), nil, nil
 		}),
 	)
 
-	logrus.Infof("Registered %d MCP tools", 15)
+	// 工具 16: notifications.mark_result — 标记通知处理结果
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name: "notifications_mark_result",
+			Description: "标记通知的处理结果，更新 MCP 内部数据库状态。\n\n" +
+				"status 合法值：\n" +
+				"  - replied：已成功回复（reply_content 填写回复内容）\n" +
+				"  - skipped：主动跳过（不需要回复，如广告、无意义评论等）\n" +
+				"  - retry：处理失败需重试（如回复超时、网络错误）\n" +
+				"  - deleted_check：评论可能已删除，下次心跳将进入详情页二次确认\n\n" +
+				"必须在每次处理通知后调用，否则下次心跳会重复返回该通知。",
+			Annotations: &mcp.ToolAnnotations{
+				Title:           "Mark Notification Result",
+				DestructiveHint: boolPtr(false),
+			},
+		},
+		withPanicRecovery("notifications_mark_result", func(ctx context.Context, req *mcp.CallToolRequest, args NotificationsMarkResultArgs) (*mcp.CallToolResult, any, error) {
+			result := appServer.handleNotificationsMarkResult(ctx, args)
+			return convertToMCPResult(result), nil, nil
+		}),
+	)
+
+	// 工具 17: notifications.stats — 通知状态统计
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name:        "notifications_stats",
+			Description: "查看通知状态统计（各状态数量、上次拉取时间），用于诊断和监控。",
+			Annotations: &mcp.ToolAnnotations{
+				Title:        "Notification Stats",
+				ReadOnlyHint: true,
+			},
+		},
+		withPanicRecovery("notifications_stats", func(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
+			result := appServer.handleNotificationsStats(ctx)
+			return convertToMCPResult(result), nil, nil
+		}),
+	)
+
+	logrus.Infof("Registered %d MCP tools", 17)
 }
 
 // convertToMCPResult 将自定义的 MCPToolResult 转换为官方 SDK 的格式

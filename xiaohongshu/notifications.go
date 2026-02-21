@@ -104,12 +104,26 @@ type NotificationsResult struct {
 	NextCursor string `json:"next_cursor,omitempty"`
 }
 
+// RetryReason 通知需要重新处理的原因
+type RetryReason string
+
+const (
+	// RetryReasonNone 全新通知，非重试
+	RetryReasonNone RetryReason = ""
+	// RetryReasonTimeout 上次处理超时或报错，需重新回复
+	RetryReasonTimeout RetryReason = "timeout"
+	// RetryReasonDeletedRecheck 上次标记为已删除，本次重新进详情页确认
+	// 原因：get_feed_detail 偶发网络问题导致评论未渲染，误判为已删除
+	RetryReasonDeletedRecheck RetryReason = "deleted_recheck"
+)
+
 // UnprocessedNotification 需要处理的通知（包含回复所需的全部字段）
 type UnprocessedNotification struct {
 	// 通知标识
 	NotificationID string                   `json:"notification_id"`
 	RelationType   NotificationRelationType `json:"relation_type"`
-	IsRetry        bool                     `json:"is_retry"` // true=待重试，false=全新通知
+	// RetryReason 重试原因：""=全新通知，"timeout"=上次超时/报错，"deleted_recheck"=上次误判为已删除需重确认
+	RetryReason RetryReason `json:"retry_reason"`
 
 	// 评论信息
 	CommentID       string `json:"comment_id"`
@@ -137,29 +151,32 @@ type UnprocessedNotification struct {
 
 // UnprocessedNotificationsResult get_unprocessed_notifications 的返回结果
 type UnprocessedNotificationsResult struct {
-	// 需要处理的通知列表（全新 + 待重试，按时间倒序）
+	// 需要处理的通知列表（全新 + 待重试 + 已删除重确认，按时间倒序）
 	Notifications []UnprocessedNotification `json:"notifications"`
 	// 本次扫描的统计信息
-	TotalScanned  int  `json:"total_scanned"`   // 扫描的通知总条数
-	TotalSkipped  int  `json:"total_skipped"`   // 已完成跳过的条数
-	TotalTooOld   int  `json:"total_too_old"`   // 因超出时间窗口被过滤的条数
-	TotalNew      int  `json:"total_new"`       // 全新通知数
-	TotalRetry    int  `json:"total_retry"`     // 待重试通知数
-	PagesScanned  int  `json:"pages_scanned"`   // 扫描了几页
-	HasMore       bool `json:"has_more"`        // 是否还有更多（受 max_results 限制时为 true）
+	TotalScanned        int  `json:"total_scanned"`         // 扫描的通知总条数
+	TotalSkipped        int  `json:"total_skipped"`         // 已完成跳过的条数
+	TotalTooOld         int  `json:"total_too_old"`         // 因超出时间窗口被过滤的条数
+	TotalNew            int  `json:"total_new"`             // 全新通知数
+	TotalRetry          int  `json:"total_retry"`           // 超时/报错待重试通知数
+	TotalDeletedRecheck int  `json:"total_deleted_recheck"` // 已删除重确认通知数
+	PagesScanned        int  `json:"pages_scanned"`         // 扫描了几页
+	HasMore             bool `json:"has_more"`              // 是否还有更多（受 max_results 限制时为 true）
 }
 
 // GetUnprocessedNotifications 获取需要处理的通知
-// processedIDs：已完成处理的 notification_id 集合（状态为已回复/已删除/已跳过）
-// retryIDs：待重试的 notification_id 集合（状态为待重试，需重新处理）
+// processedIDs：已彻底完成的 notification_id 集合（已回复/已跳过），这些通知会被跳过
+// retryIDs：上次超时/报错待重试的 notification_id 集合，不受时间窗口限制，强制包含在返回结果中
+// deletedIDs：上次标记为已删除但需重新确认的 notification_id 集合，不受时间窗口限制，强制包含在返回结果中
 // maxPages：最多扫描几页（默认3）
 // stopAfterConsecutiveDone：连续遇到多少条已完成通知后停止翻页（默认5）
-// sinceUnix：只返回此时间戳（秒）之后的通知，0 表示不限制（建议传入 48 小时前的时间戳）
+// sinceUnix：只返回此时间戳（秒）之后的通知，0 表示不限制
 // maxResults：单次最多返回多少条待处理通知（默认20，防止输出过大导致截断）
 func (n *NotificationsAction) GetUnprocessedNotifications(
 	ctx context.Context,
 	processedIDs map[string]bool,
 	retryIDs map[string]bool,
+	deletedIDs map[string]bool,
 	maxPages int,
 	stopAfterConsecutiveDone int,
 	sinceUnix int64,
@@ -197,15 +214,39 @@ func (n *NotificationsAction) GetUnprocessedNotifications(
 		for _, notif := range pageResult.Notifications {
 			id := notif.ID
 
-			// retry_ids 里的通知优先级最高：无论时间多旧，只要扫描到就必须包含
-			// 这保证了上次心跳超时/失败的通知在下次心跳一定会被重试
+			// processedIDs 优先级最高：已彻底完成的通知无论如何都跳过，
+			// 防止同一 ID 同时出现在 processedIDs 和 deletedIDs 时产生无限循环。
+			// 场景：deleted_recheck 二次确认后追加了 "已跳过" 记录，但旧的 "已删除" 记录仍在文件中，
+			// 下次心跳两个集合都会包含该 ID，此时 processedIDs 应胜出。
+			if processedIDs[id] {
+				result.TotalSkipped++
+				consecutiveDone++
+				if consecutiveDone >= stopAfterConsecutiveDone {
+					logrus.Infof("GetUnprocessedNotifications: 连续 %d 条已完成，停止翻页", consecutiveDone)
+					goto done
+				}
+				continue
+			}
+
+			// retry_ids 和 deleted_ids 次优先：无论时间多旧，只要扫描到就必须包含。
+			// 这保证了上次心跳超时/失败/误判的通知在下次心跳一定会被重新处理。
+			var forceReason RetryReason
 			if retryIDs[id] {
-				consecutiveDone = 0 // 遇到待重试通知，重置连续计数
-				result.TotalRetry++
+				forceReason = RetryReasonTimeout
+			} else if deletedIDs[id] {
+				forceReason = RetryReasonDeletedRecheck
+			}
+			if forceReason != RetryReasonNone {
+				consecutiveDone = 0
+				if forceReason == RetryReasonTimeout {
+					result.TotalRetry++
+				} else {
+					result.TotalDeletedRecheck++
+				}
 				un := UnprocessedNotification{
 					NotificationID:  id,
 					RelationType:    notif.RelationType,
-					IsRetry:         true,
+					RetryReason:     forceReason,
 					CommentID:       notif.CommentInfo.ID,
 					CommentContent:  notif.CommentInfo.Content,
 					ParentCommentID: notif.ParentCommentID,
@@ -232,21 +273,11 @@ func (n *NotificationsAction) GetUnprocessedNotifications(
 			}
 
 			// 时间窗口过滤：通知按时间倒序，遇到超出时间窗口的通知，后面更旧的都不需要了
-			// 注意：retry_ids 已在上面单独处理，不受此限制
+			// 注意：retry_ids/deleted_ids 已在上面单独处理，不受此限制
 			if sinceUnix > 0 && notif.Time < sinceUnix {
 				result.TotalTooOld++
 				logrus.Infof("GetUnprocessedNotifications: 通知 %s 时间 %d 早于 sinceUnix %d，停止扫描", id, notif.Time, sinceUnix)
 				goto done
-			}
-
-			if processedIDs[id] {
-				result.TotalSkipped++
-				consecutiveDone++
-				if consecutiveDone >= stopAfterConsecutiveDone {
-					logrus.Infof("GetUnprocessedNotifications: 连续 %d 条已完成，停止翻页", consecutiveDone)
-					goto done
-				}
-				continue
 			}
 
 			// 重置连续计数
@@ -257,7 +288,7 @@ func (n *NotificationsAction) GetUnprocessedNotifications(
 			un := UnprocessedNotification{
 				NotificationID:  id,
 				RelationType:    notif.RelationType,
-				IsRetry:         false,
+				RetryReason:     RetryReasonNone,
 				CommentID:       notif.CommentInfo.ID,
 				CommentContent:  notif.CommentInfo.Content,
 				ParentCommentID: notif.ParentCommentID,
