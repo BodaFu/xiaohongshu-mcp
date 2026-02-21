@@ -74,11 +74,12 @@ type PostCommentArgs struct {
 
 // ReplyCommentArgs 回复评论的参数
 type ReplyCommentArgs struct {
-	FeedID    string `json:"feed_id" jsonschema:"小红书笔记ID，从Feed列表获取"`
-	XsecToken string `json:"xsec_token" jsonschema:"访问令牌，从Feed列表的xsecToken字段获取"`
-	CommentID string `json:"comment_id,omitempty" jsonschema:"目标评论ID，从评论列表获取"`
-	UserID    string `json:"user_id,omitempty" jsonschema:"目标评论用户ID，从评论列表获取"`
-	Content   string `json:"content" jsonschema:"回复内容"`
+	FeedID          string `json:"feed_id" jsonschema:"小红书笔记ID，从Feed列表获取"`
+	XsecToken       string `json:"xsec_token" jsonschema:"访问令牌，从Feed列表的xsecToken字段获取"`
+	CommentID       string `json:"comment_id,omitempty" jsonschema:"目标评论ID，从评论列表获取"`
+	UserID          string `json:"user_id,omitempty" jsonschema:"目标评论用户ID，从评论列表获取"`
+	ParentCommentID string `json:"parent_comment_id,omitempty" jsonschema:"父评论ID（可选）。回复子评论（reply_to_my_comment / at_others_under_my_comment 类型）时传入，用于精确定位楼中楼结构；顶级评论（comment_on_my_note）无需传入"`
+	Content         string `json:"content" jsonschema:"回复内容"`
 }
 
 // LikeFeedArgs 点赞参数
@@ -368,11 +369,12 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 			}
 
 			argsMap := map[string]interface{}{
-				"feed_id":    args.FeedID,
-				"xsec_token": args.XsecToken,
-				"comment_id": args.CommentID,
-				"user_id":    args.UserID,
-				"content":    args.Content,
+				"feed_id":           args.FeedID,
+				"xsec_token":        args.XsecToken,
+				"comment_id":        args.CommentID,
+				"user_id":           args.UserID,
+				"parent_comment_id": args.ParentCommentID,
+				"content":           args.Content,
 			}
 			result := appServer.handleReplyComment(ctx, argsMap)
 			return convertToMCPResult(result), nil, nil
