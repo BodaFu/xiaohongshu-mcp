@@ -107,6 +107,18 @@ type GetNotificationsArgs struct {
 	SinceUnix int64  `json:"since_unix,omitempty" jsonschema:"（可选）只返回此 Unix 时间戳（秒）之后的通知，自动翻页汇总所有符合条件的通知。例如 1771200000"`
 }
 
+// GetUnprocessedNotificationsArgs 获取未处理通知的参数
+type GetUnprocessedNotificationsArgs struct {
+	// ProcessedIDs 已完成处理的 notification_id 列表（状态为已回复/已删除/已跳过）
+	ProcessedIDs []string `json:"processed_ids,omitempty" jsonschema:"已完成处理的 notification_id 列表，这些通知会被跳过"`
+	// RetryIDs 待重试的 notification_id 列表（状态为待重试，需重新处理）
+	RetryIDs []string `json:"retry_ids,omitempty" jsonschema:"待重试的 notification_id 列表，这些通知会被包含在返回结果中（is_retry=true）"`
+	// MaxPages 最多扫描几页（默认3）
+	MaxPages int `json:"max_pages,omitempty" jsonschema:"最多扫描的页数（可选，默认3）。全量补漏扫描时可传更大值"`
+	// FullScan 是否全量扫描（不提前停止，扫满 max_pages 页）
+	FullScan bool `json:"full_scan,omitempty" jsonschema:"是否全量扫描（可选，默认false）。true 时扫满 max_pages 页不提前停止，用于每10次心跳的全量补漏扫描"`
+}
+
 // InitMCPServer 初始化 MCP Server
 func InitMCPServer(appServer *AppServer) *mcp.Server {
 	// 创建 MCP Server
@@ -475,7 +487,39 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 		}),
 	)
 
-	logrus.Infof("Registered %d MCP tools", 14)
+	// 工具 15: 获取需要处理的通知（自动翻页+去重，专为 Liko 心跳设计）
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name: "get_unprocessed_notifications",
+			Description: "获取需要处理的小红书通知（自动翻页+去重）。\n" +
+				"传入已完成处理的 notification_id 列表（processed_ids）和待重试的列表（retry_ids），\n" +
+				"接口内部自动翻页扫描，直接返回需要处理的通知列表，无需调用方手动翻页。\n\n" +
+				"返回的每条通知包含回复所需的全部字段：\n" +
+				"  - notification_id, relation_type, is_retry（是否为重试）\n" +
+				"  - comment_id, comment_content, parent_comment_id（子评论必填）\n" +
+				"  - target_comment_*（被回复的评论，reply_to_my_comment 类型时有）\n" +
+				"  - user_id, user_nickname\n" +
+				"  - feed_id, xsec_token, note_title（调用 reply_comment_in_feed 和 get_feed_detail 均需要）\n" +
+				"  - time_cst（北京时间字符串）\n\n" +
+				"翻页停止条件：连续遇到 5 条已完成通知时停止（full_scan=true 时扫满 max_pages 页）。",
+			Annotations: &mcp.ToolAnnotations{
+				Title:        "Get Unprocessed Notifications",
+				ReadOnlyHint: true,
+			},
+		},
+		withPanicRecovery("get_unprocessed_notifications", func(ctx context.Context, req *mcp.CallToolRequest, args GetUnprocessedNotificationsArgs) (*mcp.CallToolResult, any, error) {
+			argsMap := map[string]interface{}{
+				"processed_ids": args.ProcessedIDs,
+				"retry_ids":     args.RetryIDs,
+				"max_pages":     float64(args.MaxPages),
+				"full_scan":     args.FullScan,
+			}
+			result := appServer.handleGetUnprocessedNotifications(ctx, argsMap)
+			return convertToMCPResult(result), nil, nil
+		}),
+	)
+
+	logrus.Infof("Registered %d MCP tools", 15)
 }
 
 // convertToMCPResult 将自定义的 MCPToolResult 转换为官方 SDK 的格式

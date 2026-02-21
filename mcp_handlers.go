@@ -821,6 +821,128 @@ func (s *AppServer) handleGetNotifications(ctx context.Context, args map[string]
 	}
 }
 
+// handleGetUnprocessedNotifications 获取需要处理的通知（自动翻页+去重）
+// 参数：
+//   - processed_ids: 已完成的 notification_id 列表（JSON 数组字符串或逗号分隔）
+//   - retry_ids: 待重试的 notification_id 列表
+//   - max_pages: 最多扫描页数（默认3，全量补漏时传更大值）
+//   - full_scan: true 时扫满 max_pages 页不提前停止（用于全量补漏扫描）
+func (s *AppServer) handleGetUnprocessedNotifications(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	// 解析已完成 ID 集合
+	processedIDs := parseIDSet(args["processed_ids"])
+	retryIDs := parseIDSet(args["retry_ids"])
+
+	maxPagesFloat, _ := args["max_pages"].(float64)
+	maxPages := int(maxPagesFloat)
+	if maxPages <= 0 {
+		maxPages = 3
+	}
+
+	stopAfterConsecutive := 5
+	fullScan, _ := args["full_scan"].(bool)
+	if fullScan {
+		stopAfterConsecutive = 999999 // 不提前停止
+	}
+
+	logrus.Infof("MCP: 获取未处理通知 - processed=%d, retry=%d, maxPages=%d, fullScan=%v",
+		len(processedIDs), len(retryIDs), maxPages, fullScan)
+
+	result, err := s.xiaohongshuService.GetUnprocessedNotifications(ctx, processedIDs, retryIDs, maxPages, stopAfterConsecutive)
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "获取通知失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("扫描完成：共扫描 %d 页 %d 条通知，跳过已完成 %d 条，待处理 %d 条（全新 %d + 待重试 %d）\n\n",
+		result.PagesScanned, result.TotalScanned, result.TotalSkipped,
+		result.TotalNew+result.TotalRetry, result.TotalNew, result.TotalRetry))
+
+	if len(result.Notifications) == 0 {
+		sb.WriteString("✅ 没有需要处理的通知")
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: sb.String()}},
+		}
+	}
+
+	for i, n := range result.Notifications {
+		tag := "全新"
+		if n.IsRetry {
+			tag = "待重试"
+		}
+
+		var relationLabel string
+		switch n.RelationType {
+		case xiaohongshu.RelationCommentOnMyNote:
+			relationLabel = "评论了我的笔记"
+		case xiaohongshu.RelationReplyToMyComment:
+			relationLabel = "回复了我的评论"
+		case xiaohongshu.RelationAtOthersUnderMyComment:
+			relationLabel = "在我的评论下@了他人"
+		case xiaohongshu.RelationMentionedMe:
+			relationLabel = "在评论中@了我"
+		default:
+			relationLabel = string(n.RelationType)
+		}
+
+		sb.WriteString(fmt.Sprintf("--- 待处理通知 %d [%s][%s] ---\n", i+1, tag, relationLabel))
+		sb.WriteString(fmt.Sprintf("notification_id: %s\n", n.NotificationID))
+		sb.WriteString(fmt.Sprintf("时间: %s\n", n.TimeCST))
+		sb.WriteString(fmt.Sprintf("用户: %s (user_id: %s)\n", n.UserNickname, n.UserID))
+		sb.WriteString(fmt.Sprintf("评论内容: %s\n", n.CommentContent))
+		sb.WriteString(fmt.Sprintf("comment_id: %s\n", n.CommentID))
+
+		if n.ParentCommentID != "" {
+			sb.WriteString(fmt.Sprintf("parent_comment_id: %s\n", n.ParentCommentID))
+		}
+		if n.TargetCommentContent != "" {
+			sb.WriteString(fmt.Sprintf("被回复的评论: [%s] %s\n",
+				n.TargetCommentAuthor, truncate(n.TargetCommentContent, 60)))
+		}
+
+		sb.WriteString(fmt.Sprintf("笔记: %s\n", truncate(n.NoteTitle, 40)))
+		sb.WriteString(fmt.Sprintf("feed_id: %s\n", n.FeedID))
+		sb.WriteString(fmt.Sprintf("xsec_token: %s\n", n.XsecToken))
+		sb.WriteString("\n")
+	}
+
+	return &MCPToolResult{
+		Content: []MCPContent{{Type: "text", Text: sb.String()}},
+	}
+}
+
+// parseIDSet 将参数解析为 notification_id 的 set
+// 支持两种格式：
+//   - []interface{}（JSON 数组）
+//   - string（逗号分隔）
+func parseIDSet(v interface{}) map[string]bool {
+	result := make(map[string]bool)
+	if v == nil {
+		return result
+	}
+	switch val := v.(type) {
+	case []interface{}:
+		for _, item := range val {
+			if s, ok := item.(string); ok && s != "" {
+				result[s] = true
+			}
+		}
+	case string:
+		if val == "" {
+			return result
+		}
+		for _, id := range strings.Split(val, ",") {
+			id = strings.TrimSpace(id)
+			if id != "" {
+				result[id] = true
+			}
+		}
+	}
+	return result
+}
+
 // truncate 截断字符串到指定长度
 func truncate(s string, n int) string {
 	runes := []rune(s)

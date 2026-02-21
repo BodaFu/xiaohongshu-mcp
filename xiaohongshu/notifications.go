@@ -104,6 +104,147 @@ type NotificationsResult struct {
 	NextCursor string `json:"next_cursor,omitempty"`
 }
 
+// UnprocessedNotification 需要处理的通知（包含回复所需的全部字段）
+type UnprocessedNotification struct {
+	// 通知标识
+	NotificationID string                   `json:"notification_id"`
+	RelationType   NotificationRelationType `json:"relation_type"`
+	IsRetry        bool                     `json:"is_retry"` // true=待重试，false=全新通知
+
+	// 评论信息
+	CommentID       string `json:"comment_id"`
+	CommentContent  string `json:"comment_content"`
+	ParentCommentID string `json:"parent_comment_id,omitempty"` // 子评论必填，顶级评论为空
+
+	// 被回复的评论（comment/comment 类型时有，即 reply_to_my_comment / at_others_under_my_comment）
+	TargetCommentID      string `json:"target_comment_id,omitempty"`
+	TargetCommentContent string `json:"target_comment_content,omitempty"`
+	TargetCommentAuthor  string `json:"target_comment_author,omitempty"`
+
+	// 发通知的用户
+	UserID       string `json:"user_id"`
+	UserNickname string `json:"user_nickname"`
+
+	// 关联笔记（调用 reply_comment_in_feed 和 get_feed_detail 都需要）
+	FeedID    string `json:"feed_id"`
+	XsecToken string `json:"xsec_token"`
+	NoteTitle string `json:"note_title"` // 笔记标题/摘要，帮助 Liko 了解上下文
+
+	// 时间（Unix 秒，CST 格式字符串）
+	TimeUnix int64  `json:"time_unix"`
+	TimeCST  string `json:"time_cst"`
+}
+
+// UnprocessedNotificationsResult get_unprocessed_notifications 的返回结果
+type UnprocessedNotificationsResult struct {
+	// 需要处理的通知列表（全新 + 待重试，按时间倒序）
+	Notifications []UnprocessedNotification `json:"notifications"`
+	// 本次扫描的统计信息
+	TotalScanned  int `json:"total_scanned"`  // 扫描的通知总条数
+	TotalSkipped  int `json:"total_skipped"`  // 已完成跳过的条数
+	TotalNew      int `json:"total_new"`      // 全新通知数
+	TotalRetry    int `json:"total_retry"`    // 待重试通知数
+	PagesScanned  int `json:"pages_scanned"`  // 扫描了几页
+}
+
+// GetUnprocessedNotifications 获取需要处理的通知
+// processedIDs：已完成处理的 notification_id 集合（状态为已回复/已删除/已跳过）
+// retryIDs：待重试的 notification_id 集合（状态为待重试，需重新处理）
+// maxPages：最多扫描几页（默认3），全量补漏扫描时传更大值
+// stopAfterConsecutiveDone：连续遇到多少条已完成通知后停止翻页（默认5）
+func (n *NotificationsAction) GetUnprocessedNotifications(
+	ctx context.Context,
+	processedIDs map[string]bool,
+	retryIDs map[string]bool,
+	maxPages int,
+	stopAfterConsecutiveDone int,
+) (*UnprocessedNotificationsResult, error) {
+	if maxPages <= 0 {
+		maxPages = 3
+	}
+	if stopAfterConsecutiveDone <= 0 {
+		stopAfterConsecutiveDone = 5
+	}
+
+	cst := time.FixedZone("CST", 8*3600)
+	result := &UnprocessedNotificationsResult{}
+
+	var cursor string
+	consecutiveDone := 0
+
+	for page := 0; page < maxPages; page++ {
+		pageResult, err := n.GetNotifications(ctx, cursor, 20)
+		if err != nil {
+			if page == 0 {
+				return nil, err
+			}
+			// 翻页失败不影响已有结果
+			logrus.Warnf("GetUnprocessedNotifications: 第 %d 页获取失败: %v，使用已有结果", page+1, err)
+			break
+		}
+
+		result.PagesScanned++
+		result.TotalScanned += len(pageResult.Notifications)
+
+		for _, notif := range pageResult.Notifications {
+			id := notif.ID
+
+			if processedIDs[id] {
+				// 已完成，跳过，统计连续已完成计数
+				result.TotalSkipped++
+				consecutiveDone++
+				if consecutiveDone >= stopAfterConsecutiveDone {
+					logrus.Infof("GetUnprocessedNotifications: 连续 %d 条已完成，停止翻页", consecutiveDone)
+					goto done
+				}
+				continue
+			}
+
+			// 重置连续计数（遇到未完成的通知）
+			consecutiveDone = 0
+
+			isRetry := retryIDs[id]
+			if isRetry {
+				result.TotalRetry++
+			} else {
+				result.TotalNew++
+			}
+
+			un := UnprocessedNotification{
+				NotificationID:  id,
+				RelationType:    notif.RelationType,
+				IsRetry:         isRetry,
+				CommentID:       notif.CommentInfo.ID,
+				CommentContent:  notif.CommentInfo.Content,
+				ParentCommentID: notif.ParentCommentID,
+				UserID:          notif.UserInfo.UserID,
+				UserNickname:    notif.UserInfo.Nickname,
+				FeedID:          notif.ItemInfo.ID,
+				XsecToken:       notif.ItemInfo.XsecToken,
+				NoteTitle:       notif.ItemInfo.Content,
+				TimeUnix:        notif.Time,
+				TimeCST:         time.Unix(notif.Time, 0).In(cst).Format("2006-01-02 15:04"),
+			}
+
+			if notif.CommentInfo.TargetComment != nil {
+				un.TargetCommentID = notif.CommentInfo.TargetComment.ID
+				un.TargetCommentContent = notif.CommentInfo.TargetComment.Content
+				un.TargetCommentAuthor = notif.CommentInfo.TargetComment.UserInfo.Nickname
+			}
+
+			result.Notifications = append(result.Notifications, un)
+		}
+
+		if !pageResult.HasMore || pageResult.NextCursor == "" {
+			break
+		}
+		cursor = pageResult.NextCursor
+	}
+
+done:
+	return result, nil
+}
+
 // mentionsAPIResponse 小红书 mentions API 的原始响应结构
 type mentionsAPIResponse struct {
 	Code    int    `json:"code"`

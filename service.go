@@ -606,6 +606,31 @@ func (s *XiaohongshuService) GetNotificationsSince(ctx context.Context, sinceUni
 	return action.GetNotificationsSince(ctx, sinceUnix)
 }
 
+// GetUnprocessedNotifications 获取需要处理的通知（自动翻页+去重）
+// processedIDs：已完成处理的 notification_id 集合
+// retryIDs：待重试的 notification_id 集合
+// maxPages：最多扫描几页
+// stopAfterConsecutiveDone：连续遇到多少条已完成通知后停止翻页
+func (s *XiaohongshuService) GetUnprocessedNotifications(
+	ctx context.Context,
+	processedIDs map[string]bool,
+	retryIDs map[string]bool,
+	maxPages int,
+	stopAfterConsecutiveDone int,
+) (*xiaohongshu.UnprocessedNotificationsResult, error) {
+	notificationsMu.Lock()
+	defer notificationsMu.Unlock()
+
+	b := newBrowser()
+	defer b.Close()
+
+	page := b.NewPage()
+	defer page.Close()
+
+	action := xiaohongshu.NewNotificationsAction(page)
+	return action.GetUnprocessedNotifications(ctx, processedIDs, retryIDs, maxPages, stopAfterConsecutiveDone)
+}
+
 // GetMyProfile 获取当前登录用户的个人信息
 func (s *XiaohongshuService) GetMyProfile(ctx context.Context) (*UserProfileResponse, error) {
 	var result *xiaohongshu.UserProfileResponse
