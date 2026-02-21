@@ -827,8 +827,9 @@ func (s *AppServer) handleGetNotifications(ctx context.Context, args map[string]
 //   - retry_ids: 待重试的 notification_id 列表
 //   - max_pages: 最多扫描页数（默认3，全量补漏时传更大值）
 //   - full_scan: true 时扫满 max_pages 页不提前停止（用于全量补漏扫描）
+//   - since_hours: 只返回最近 N 小时内的通知（默认48），防止旧通知重复返回
+//   - max_results: 单次最多返回多少条（默认20），防止输出截断
 func (s *AppServer) handleGetUnprocessedNotifications(ctx context.Context, args map[string]interface{}) *MCPToolResult {
-	// 解析已完成 ID 集合
 	processedIDs := parseIDSet(args["processed_ids"])
 	retryIDs := parseIDSet(args["retry_ids"])
 
@@ -841,13 +842,34 @@ func (s *AppServer) handleGetUnprocessedNotifications(ctx context.Context, args 
 	stopAfterConsecutive := 5
 	fullScan, _ := args["full_scan"].(bool)
 	if fullScan {
-		stopAfterConsecutive = 999999 // 不提前停止
+		stopAfterConsecutive = 999999
 	}
 
-	logrus.Infof("MCP: 获取未处理通知 - processed=%d, retry=%d, maxPages=%d, fullScan=%v",
-		len(processedIDs), len(retryIDs), maxPages, fullScan)
+	// sinceUnix 从 processed_ids 和 retry_ids 里取最大的 notification_id（雪花 ID），
+	// 提取其中的时间戳作为扫描起点——只返回这条最新已处理通知之后的通知。
+	// 这样即使记录文件被清理，也不会因为旧 ID 消失而把大量旧通知误判为未处理。
+	// 如果两个集合都为空（首次运行），退回到 since_hours 参数（默认 48 小时）。
+	sinceHoursFloat, _ := args["since_hours"].(float64)
+	sinceHours := int(sinceHoursFloat)
+	if sinceHours <= 0 {
+		sinceHours = 48
+	}
+	sinceUnix := extractSinceUnixFromIDs(processedIDs, retryIDs)
+	if sinceUnix == 0 {
+		// processed_ids 和 retry_ids 均为空（首次运行），退回到 since_hours 兜底
+		sinceUnix = time.Now().Unix() - int64(sinceHours)*3600
+	}
 
-	result, err := s.xiaohongshuService.GetUnprocessedNotifications(ctx, processedIDs, retryIDs, maxPages, stopAfterConsecutive)
+	maxResultsFloat, _ := args["max_results"].(float64)
+	maxResults := int(maxResultsFloat)
+	if maxResults <= 0 {
+		maxResults = 20
+	}
+
+	logrus.Infof("MCP: 获取未处理通知 - processed=%d, retry=%d, maxPages=%d, fullScan=%v, sinceUnix=%d, maxResults=%d",
+		len(processedIDs), len(retryIDs), maxPages, fullScan, sinceUnix, maxResults)
+
+	result, err := s.xiaohongshuService.GetUnprocessedNotifications(ctx, processedIDs, retryIDs, maxPages, stopAfterConsecutive, sinceUnix, maxResults)
 	if err != nil {
 		return &MCPToolResult{
 			Content: []MCPContent{{Type: "text", Text: "获取通知失败: " + err.Error()}},
@@ -856,9 +878,13 @@ func (s *AppServer) handleGetUnprocessedNotifications(ctx context.Context, args 
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("扫描完成：共扫描 %d 页 %d 条通知，跳过已完成 %d 条，待处理 %d 条（全新 %d + 待重试 %d）\n\n",
-		result.PagesScanned, result.TotalScanned, result.TotalSkipped,
+	sb.WriteString(fmt.Sprintf("扫描完成：共扫描 %d 页 %d 条通知，跳过已完成 %d 条，过滤超时窗口 %d 条，待处理 %d 条（全新 %d + 待重试 %d）\n",
+		result.PagesScanned, result.TotalScanned, result.TotalSkipped, result.TotalTooOld,
 		result.TotalNew+result.TotalRetry, result.TotalNew, result.TotalRetry))
+	if result.HasMore {
+		sb.WriteString("⚠️ 待处理通知超过单次返回上限，本次仅返回部分。处理完后请再次调用获取剩余通知。\n")
+	}
+	sb.WriteString("\n")
 
 	if len(result.Notifications) == 0 {
 		sb.WriteString("✅ 没有需要处理的通知")
@@ -911,6 +937,38 @@ func (s *AppServer) handleGetUnprocessedNotifications(ctx context.Context, args 
 	return &MCPToolResult{
 		Content: []MCPContent{{Type: "text", Text: sb.String()}},
 	}
+}
+
+// extractSinceUnixFromIDs 从 processed_ids / retry_ids 中提取最大雪花 ID 对应的 Unix 时间戳（秒）。
+// 小红书雪花 ID 高 41 位是毫秒时间戳（相对于 2013-01-01 00:00:00 UTC 的偏移）。
+// 取最大 ID 对应的时间，作为"只返回这个时间点之后的通知"的下界。
+// 如果所有集合都为空，返回 0（调用方退回默认时间窗口）。
+func extractSinceUnixFromIDs(sets ...map[string]bool) int64 {
+	// 小红书雪花 ID epoch：2013-01-01 00:00:00 UTC（毫秒）
+	const xhsEpochMs int64 = 1356998400000
+
+	var maxID uint64
+	for _, set := range sets {
+		for id := range set {
+			var v uint64
+			_, err := fmt.Sscanf(id, "%d", &v)
+			if err != nil {
+				continue
+			}
+			if v > maxID {
+				maxID = v
+			}
+		}
+	}
+
+	if maxID == 0 {
+		return 0
+	}
+
+	// 雪花 ID 右移 22 位得到相对 epoch 的毫秒偏移
+	msOffset := int64(maxID >> 22)
+	unixMs := xhsEpochMs + msOffset
+	return unixMs / 1000
 }
 
 // parseIDSet 将参数解析为 notification_id 的 set

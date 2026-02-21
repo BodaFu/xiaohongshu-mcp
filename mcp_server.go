@@ -117,6 +117,11 @@ type GetUnprocessedNotificationsArgs struct {
 	MaxPages int `json:"max_pages,omitempty" jsonschema:"最多扫描的页数（可选，默认3）。全量补漏扫描时可传更大值"`
 	// FullScan 是否全量扫描（不提前停止，扫满 max_pages 页）
 	FullScan bool `json:"full_scan,omitempty" jsonschema:"是否全量扫描（可选，默认false）。true 时扫满 max_pages 页不提前停止，用于每10次心跳的全量补漏扫描"`
+	// SinceHours 兜底时间窗口（小时，默认48）。仅当 processed_ids 和 retry_ids 均为空时生效（首次运行）。
+	// 正常情况下接口会自动从 processed_ids 中最大的 notification_id 提取时间戳作为扫描起点，无需手动设置此参数。
+	SinceHours int `json:"since_hours,omitempty" jsonschema:"兜底时间窗口（小时，可选，默认48）。仅当 processed_ids 和 retry_ids 均为空时生效。正常情况下接口自动从已处理 ID 中推算扫描起点，无需设置"`
+	// MaxResults 单次最多返回多少条待处理通知（默认20）。超出时 has_more=true，需再次调用处理剩余
+	MaxResults int `json:"max_results,omitempty" jsonschema:"单次最多返回的待处理通知数量（可选，默认20）。防止返回过多导致输出截断。has_more=true 时需再次调用"`
 }
 
 // InitMCPServer 初始化 MCP Server
@@ -491,7 +496,7 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 	mcp.AddTool(server,
 		&mcp.Tool{
 			Name: "get_unprocessed_notifications",
-			Description: "获取需要处理的小红书通知（自动翻页+去重）。\n" +
+			Description: "获取需要处理的小红书通知（自动翻页+去重+时间窗口过滤）。\n" +
 				"传入已完成处理的 notification_id 列表（processed_ids）和待重试的列表（retry_ids），\n" +
 				"接口内部自动翻页扫描，直接返回需要处理的通知列表，无需调用方手动翻页。\n\n" +
 				"返回的每条通知包含回复所需的全部字段：\n" +
@@ -501,6 +506,9 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 				"  - user_id, user_nickname\n" +
 				"  - feed_id, xsec_token, note_title（调用 reply_comment_in_feed 和 get_feed_detail 均需要）\n" +
 				"  - time_cst（北京时间字符串）\n\n" +
+				"关键参数：\n" +
+				"  - since_hours（默认48，兜底参数）：仅当 processed_ids/retry_ids 均为空时生效；正常情况下接口自动从最大已处理 ID 推算扫描起点\n" +
+				"  - max_results（默认20）：单次最多返回条数，防止输出过大被截断；has_more=true 时需再次调用\n" +
 				"翻页停止条件：连续遇到 5 条已完成通知时停止（full_scan=true 时扫满 max_pages 页）。",
 			Annotations: &mcp.ToolAnnotations{
 				Title:        "Get Unprocessed Notifications",
@@ -513,6 +521,8 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 				"retry_ids":     args.RetryIDs,
 				"max_pages":     float64(args.MaxPages),
 				"full_scan":     args.FullScan,
+				"since_hours":   float64(args.SinceHours),
+				"max_results":   float64(args.MaxResults),
 			}
 			result := appServer.handleGetUnprocessedNotifications(ctx, argsMap)
 			return convertToMCPResult(result), nil, nil

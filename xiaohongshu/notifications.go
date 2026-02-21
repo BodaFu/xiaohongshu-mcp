@@ -140,30 +140,39 @@ type UnprocessedNotificationsResult struct {
 	// 需要处理的通知列表（全新 + 待重试，按时间倒序）
 	Notifications []UnprocessedNotification `json:"notifications"`
 	// 本次扫描的统计信息
-	TotalScanned  int `json:"total_scanned"`  // 扫描的通知总条数
-	TotalSkipped  int `json:"total_skipped"`  // 已完成跳过的条数
-	TotalNew      int `json:"total_new"`      // 全新通知数
-	TotalRetry    int `json:"total_retry"`    // 待重试通知数
-	PagesScanned  int `json:"pages_scanned"`  // 扫描了几页
+	TotalScanned  int  `json:"total_scanned"`   // 扫描的通知总条数
+	TotalSkipped  int  `json:"total_skipped"`   // 已完成跳过的条数
+	TotalTooOld   int  `json:"total_too_old"`   // 因超出时间窗口被过滤的条数
+	TotalNew      int  `json:"total_new"`       // 全新通知数
+	TotalRetry    int  `json:"total_retry"`     // 待重试通知数
+	PagesScanned  int  `json:"pages_scanned"`   // 扫描了几页
+	HasMore       bool `json:"has_more"`        // 是否还有更多（受 max_results 限制时为 true）
 }
 
 // GetUnprocessedNotifications 获取需要处理的通知
 // processedIDs：已完成处理的 notification_id 集合（状态为已回复/已删除/已跳过）
 // retryIDs：待重试的 notification_id 集合（状态为待重试，需重新处理）
-// maxPages：最多扫描几页（默认3），全量补漏扫描时传更大值
+// maxPages：最多扫描几页（默认3）
 // stopAfterConsecutiveDone：连续遇到多少条已完成通知后停止翻页（默认5）
+// sinceUnix：只返回此时间戳（秒）之后的通知，0 表示不限制（建议传入 48 小时前的时间戳）
+// maxResults：单次最多返回多少条待处理通知（默认20，防止输出过大导致截断）
 func (n *NotificationsAction) GetUnprocessedNotifications(
 	ctx context.Context,
 	processedIDs map[string]bool,
 	retryIDs map[string]bool,
 	maxPages int,
 	stopAfterConsecutiveDone int,
+	sinceUnix int64,
+	maxResults int,
 ) (*UnprocessedNotificationsResult, error) {
 	if maxPages <= 0 {
 		maxPages = 3
 	}
 	if stopAfterConsecutiveDone <= 0 {
 		stopAfterConsecutiveDone = 5
+	}
+	if maxResults <= 0 {
+		maxResults = 20
 	}
 
 	cst := time.FixedZone("CST", 8*3600)
@@ -178,7 +187,6 @@ func (n *NotificationsAction) GetUnprocessedNotifications(
 			if page == 0 {
 				return nil, err
 			}
-			// 翻页失败不影响已有结果
 			logrus.Warnf("GetUnprocessedNotifications: 第 %d 页获取失败: %v，使用已有结果", page+1, err)
 			break
 		}
@@ -189,8 +197,14 @@ func (n *NotificationsAction) GetUnprocessedNotifications(
 		for _, notif := range pageResult.Notifications {
 			id := notif.ID
 
+			// 时间窗口过滤：通知按时间倒序，遇到超出时间窗口的通知，后面更旧的都不需要了
+			if sinceUnix > 0 && notif.Time < sinceUnix {
+				result.TotalTooOld++
+				logrus.Infof("GetUnprocessedNotifications: 通知 %s 时间 %d 早于 sinceUnix %d，停止扫描", id, notif.Time, sinceUnix)
+				goto done
+			}
+
 			if processedIDs[id] {
-				// 已完成，跳过，统计连续已完成计数
 				result.TotalSkipped++
 				consecutiveDone++
 				if consecutiveDone >= stopAfterConsecutiveDone {
@@ -200,7 +214,7 @@ func (n *NotificationsAction) GetUnprocessedNotifications(
 				continue
 			}
 
-			// 重置连续计数（遇到未完成的通知）
+			// 重置连续计数
 			consecutiveDone = 0
 
 			isRetry := retryIDs[id]
@@ -233,6 +247,13 @@ func (n *NotificationsAction) GetUnprocessedNotifications(
 			}
 
 			result.Notifications = append(result.Notifications, un)
+
+			// 达到单次返回上限，标记 has_more=true 并停止
+			if len(result.Notifications) >= maxResults {
+				result.HasMore = true
+				logrus.Infof("GetUnprocessedNotifications: 已达 maxResults=%d，停止扫描", maxResults)
+				goto done
+			}
 		}
 
 		if !pageResult.HasMore || pageResult.NextCursor == "" {
